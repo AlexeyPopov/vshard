@@ -1680,9 +1680,9 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
     end
     cfg = lcfg.check(cfg, M.current_cfg)
     local vshard_cfg, box_cfg = lcfg.split(cfg)
-    if vshard_cfg.weights or vshard_cfg.zone then
-        error('Weights and zone are not allowed for storage configuration')
-    end
+    --if vshard_cfg.weights or vshard_cfg.zone then
+    --    error('Weights and zone are not allowed for storage configuration')
+    --end
     if M.replicasets then
         log.info("Starting reconfiguration of replica %s", this_replica_uuid)
     else
@@ -1799,7 +1799,10 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
         local old = box.space._bucket:on_replace()[1]
         box.space._bucket:on_replace(bucket_generation_increment, old)
     end
-
+    for _, replicaset in pairs(new_replicasets) do
+        replicaset:connect_all()
+    end
+    lreplicaset.wait_masters_connect(new_replicasets)
     lreplicaset.rebind_replicasets(new_replicasets, M.replicasets)
     lreplicaset.outdate_replicasets(M.replicasets)
     M.replicasets = new_replicasets
@@ -1838,9 +1841,183 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
         M.rebalancer_fiber:cancel()
         M.rebalancer_fiber = nil
     end
+	local old_route_map = M.route_map
+    M.route_map = table_new(M.total_bucket_count, 0)
+    for bucket, rs in pairs(old_route_map) do
+        local new_rs = M.replicasets[rs.uuid]
+        if new_rs then
+            M.route_map[bucket] = new_rs
+            new_rs.bucket_count = new_rs.bucket_count + 1
+        end
+    end
+    if M.failover_fiber == nil then
+        M.failover_fiber = util.reloadable_fiber_create(
+            'vshard.failover.' .. M.routername, M, 'failover_f')
+    end
+    if M.discovery_fiber == nil then
+        M.discovery_fiber = util.reloadable_fiber_create(
+            'vshard.discovery.' .. M.routername, M, 'discovery_f')
+    end
     lua_gc.set_state(M.collect_lua_garbage, consts.COLLECT_LUA_GARBAGE_INTERVAL)
     -- Destroy connections, not used in a new configuration.
     collectgarbage()
+end
+
+local function discovery_f()
+    local module_version = M.module_version
+    while module_version == M.module_version do
+        while not next(M.replicasets) do
+            lfiber.sleep(consts.DISCOVERY_INTERVAL)
+        end
+        local old_replicasets = M.replicasets
+        for rs_uuid, replicaset in pairs(M.replicasets) do
+            local active_buckets, err =
+                replicaset:callro('vshard.storage.buckets_discovery', {},
+                                  {timeout = 2})
+            while M.errinj.ERRINJ_LONG_DISCOVERY do
+                M.errinj.ERRINJ_LONG_DISCOVERY = 'waiting'
+                lfiber.sleep(0.01)
+            end
+            -- Renew replicasets object captured by the for loop
+            -- in case of reconfigure and reload events.
+            if M.replicasets ~= old_replicasets then
+                break
+            end
+            if not active_buckets then
+                log.error('Error during discovery %s: %s', replicaset, err)
+            else
+                if #active_buckets ~= replicaset.bucket_count then
+                    log.info('Updated %s buckets: was %d, became %d',
+                             replicaset, replicaset.bucket_count,
+                             #active_buckets)
+                end
+                replicaset.bucket_count = #active_buckets
+                for _, bucket_id in pairs(active_buckets) do
+                    local old_rs = M.route_map[bucket_id]
+                    if old_rs and old_rs ~= replicaset then
+                        old_rs.bucket_count = old_rs.bucket_count - 1
+                    end
+                    M.route_map[bucket_id] = replicaset
+                end
+            end
+            lfiber.sleep(consts.DISCOVERY_INTERVAL)
+        end
+    end
+end
+
+local function failover_f()
+    local module_version = M.module_version
+    local min_timeout = math.min(consts.FAILOVER_UP_TIMEOUT,
+                                 consts.FAILOVER_DOWN_TIMEOUT)
+    -- This flag is used to avoid logging like:
+    -- 'All is ok ... All is ok ... All is ok ...'
+    -- each min_timeout seconds.
+    local prev_was_ok = false
+    while module_version == M.module_version do
+::continue::
+        local ok, replica_is_changed = pcall(failover_step, router)
+        if not ok then
+            log.error('Error during failovering: %s',
+                      lerror.make(replica_is_changed))
+            replica_is_changed = true
+        elseif not prev_was_ok then
+            log.info('All replicas are ok')
+        end
+        prev_was_ok = not replica_is_changed
+        local logf
+        if replica_is_changed then
+            logf = log.info
+        else
+            -- In any case it is necessary to periodically log
+            -- failover heartbeat.
+            logf = log.verbose
+        end
+        logf('Failovering step is finished. Schedule next after %f seconds',
+             min_timeout)
+        lfiber.sleep(min_timeout)
+    end
+end
+
+local function failover_ping_round()
+    for _, replicaset in pairs(M.replicasets) do
+        local replica = replicaset.replica
+        if replica ~= nil and replica.conn ~= nil and
+           replica.down_ts == nil then
+            if not replica.conn:ping({timeout = 5}) then
+                log.info('Ping error from %s: perhaps a connection is down',
+                         replica)
+                -- Connection hangs. Recreate it to be able to
+                -- fail over to a replica next by priority.
+                replica.conn:close()
+                replicaset:connect_replica(replica)
+            end
+        end
+    end
+end
+
+local function failover_need_down_priority(replicaset, curr_ts)
+    local r = replicaset.replica
+    if r and r.down_ts then
+        assert(not r:is_connected())
+    end
+    return r and r.down_ts and
+           curr_ts - r.down_ts >= consts.FAILOVER_DOWN_TIMEOUT
+           and r.next_by_priority
+end
+
+local function failover_need_up_priority(replicaset, curr_ts)
+    local up_ts = replicaset.replica_up_ts
+    return not up_ts or curr_ts - up_ts >= consts.FAILOVER_UP_TIMEOUT
+end
+
+local function failover_collect_to_update()
+    local ts = lfiber.time()
+    local uuid_to_update = {}
+    for uuid, rs in pairs(M.replicasets) do
+        if failover_need_down_priority(rs, ts) or
+           failover_need_up_priority(rs, ts) then
+            table.insert(uuid_to_update, uuid)
+        end
+    end
+    return uuid_to_update
+end
+
+local function failover_step()
+    failover_ping_round()
+    local uuid_to_update = failover_collect_to_update()
+    if #uuid_to_update == 0 then
+        return false
+    end
+    local curr_ts = lfiber.time()
+    local replica_is_changed = false
+    for _, uuid in pairs(uuid_to_update) do
+        local rs = M.replicasets[uuid]
+        if M.errinj.ERRINJ_FAILOVER_CHANGE_CFG then
+            rs = nil
+            M.errinj.ERRINJ_FAILOVER_CHANGE_CFG = false
+        end
+        if rs == nil then
+            log.info('Configuration has changed, restart failovering')
+            lfiber.yield()
+            return true
+        end
+        if not next(rs.replicas) then
+            goto continue
+        end
+        local old_replica = rs.replica
+        if failover_need_up_priority(rs, curr_ts) then
+            rs:up_replica_priority()
+        end
+        if failover_need_down_priority(rs, curr_ts) then
+            rs:down_replica_priority()
+        end
+        if old_replica ~= rs.replica then
+            log.info('New replica %s for %s', rs.replica, rs)
+            replica_is_changed = true
+        end
+::continue::
+    end
+    return replica_is_changed
 end
 
 --------------------------------------------------------------------------------
